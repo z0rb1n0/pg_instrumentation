@@ -1,6 +1,11 @@
 BEGIN TRANSACTION;
 SET TRANSACTION READ WRITE;
 
+
+CREATE OR REPLACE PROCEDURAL LANGUAGE 'plperlu';
+
+CREATE SCHEMA IF NOT EXISTS "instrumentation";
+
 DROP VIEW IF EXISTS "instrumentation"."os_sys_cpu_threads";
 DROP VIEW IF EXISTS "instrumentation"."os_sys_cpu_cores";
 DROP VIEW IF EXISTS "instrumentation"."os_sys_cpu_pps";
@@ -13,7 +18,7 @@ DROP VIEW IF EXISTS "instrumentation"."os_proc_processes";
 DROP VIEW IF EXISTS "instrumentation"."os_proc_loadavg";
 DROP VIEW IF EXISTS "instrumentation"."os_proc_stat";
 
-DROP FUNCTION IF EXISTS instrumentation.pg_read_file_soft(TEXT, BIGINT, BIGINT);
+DROP FUNCTION IF EXISTS instrumentation.read_file_abs(TEXT, BIGINT, BIGINT);
 DROP FUNCTION IF EXISTS instrumentation.get_os_sys_cpus();
 DROP FUNCTION IF EXISTS instrumentation.os_sys_cpu_pps();
 DROP FUNCTION IF EXISTS instrumentation.os_sys_cpu_cores();
@@ -27,42 +32,117 @@ DROP FUNCTION IF EXISTS instrumentation.get_os_proc_processes_io();
 
 GRANT USAGE ON SCHEMA "instrumentation" TO PUBLIC;
 
--- symlinks to /sys and /proc must be created in the postgresql directory for this to work
-DO LANGUAGE 'plpgsql' $lc$
-DECLARE required_symlink TEXT;
-DECLARE failed_checks INT;
-BEGIN
+CREATE FUNCTION instrumentation.ls_dir_abs(
+	dir_name TEXT
+) RETURNS SETOF TEXT LANGUAGE 'plperlu' SECURITY INVOKER STABLE RETURNS NULL ON NULL INPUT AS $CODE$
+use strict;
+use warnings;
 
-	failed_checks := 0;
-	FOR required_symlink IN
-		SELECT UNNEST(CAST('{sys,proc}' AS TEXT[]))
-	LOOP
-		IF (required_symlink NOT IN (SELECT pg_ls_dir('.'))) THEN
-			failed_checks := (failed_checks + 1);
-			RAISE WARNING 'Missing symlink in postgresql data dir: `%`. Session will be terminated', required_symlink;
-		END IF;
-	END LOOP;
+my $d_h;
 
-	IF (failed_checks > 0) THEN
-		SELECT pg_catalog.pg_terminate_backend(pg_catalog.pg_backend_pid());
-	END IF;
-END;
-$lc$;
+	opendir($d_h, $_[0]) || return(undef);
+	while (my $next_dir = readdir($d_h)) {
+		# the builtin skips . and ..
+		(($next_dir ne ".") && ($next_dir ne "..")) && return_next($next_dir);
+	}
+	closedir($d_h) || exit(undef);
+	return undef;
+$CODE$;
+REVOKE ALL PRIVILEGES ON FUNCTION instrumentation.ls_dir_abs(text) FROM PUBLIC; -- just for good measure
+COMMENT ON FUNCTION instrumentation.ls_dir_abs(text) IS 'Insecure version of pg_ls_dir. This allows the listing of any directory in the file system the backend process has access to';
 
-CREATE FUNCTION instrumentation.pg_read_file_soft(
+
+CREATE FUNCTION instrumentation.read_binary_files_abs(
+	file_names TEXT[],
+	read_start BIGINT DEFAULT 0,
+	read_length BIGINT DEFAULT 536870912
+) RETURNS TABLE (
+	fn TEXT,
+	fd BYTEA
+) LANGUAGE 'plperlu' SECURITY INVOKER STABLE RETURNS NULL ON NULL INPUT AS $CODE$
+use strict;
+use warnings;
+use Fcntl;
+
+	foreach my $next_file (@{$_[0]}) {
+		my $f_h;
+		my $next_buf = undef;
+		if (sysopen($f_h, $next_file, Fcntl::O_RDONLY)) {
+
+			defined($_[1]) && sysseek($f_h, $_[1], Fcntl::SEEK_SET);
+
+			sysread($f_h, $next_buf, $_[2]) || ($next_buf = undef);
+			
+			close($f_h) || exit(undef);
+		}
+		return_next({"fn" => $next_file, "fd" => $next_buf});
+	}
+	return undef;
+
+$CODE$;
+REVOKE ALL PRIVILEGES ON FUNCTION instrumentation.read_binary_files_abs(TEXT[], BIGINT, BIGINT) FROM PUBLIC; -- just for good measure
+COMMENT ON FUNCTION instrumentation.read_binary_files_abs(TEXT[], BIGINT, BIGINT) IS 'Multi-file version of read_binary_file_abs (see below). Allows the passing of multiple file names as an array.
+This exists for optimization reasons: plperlu starts a new interpreter for each function call, which makes read_binary_file_abs inefficient for a large number of files.
+Returns a row for each input file. Output columns:
+	fn (file name): the full path of the file
+	fd (file data): data retrieved for the specified file. Null
+';
+
+CREATE FUNCTION instrumentation.read_binary_file_abs(
 	file_name TEXT,
 	read_start BIGINT DEFAULT 0,
 	read_length BIGINT DEFAULT 536870912
-) RETURNS TEXT LANGUAGE 'plpgsql' VOLATILE RETURNS NULL ON NULL INPUT AS $CODE$
-BEGIN
-	RETURN pg_read_file(file_name, read_start, read_length);
-EXCEPTION
-	WHEN others THEN
-		RETURN null;
-END;
+) RETURNS BYTEA LANGUAGE 'sql' SECURITY INVOKER STABLE RETURNS NULL ON NULL INPUT AS $CODE$
+	SELECT
+		rbfa.fd
+	FROM
+		instrumentation.read_binary_files_abs(ARRAY[$1], $2, $3) AS rbfa
+	;
 $CODE$;
-COMMENT ON FUNCTION instrumentation.pg_read_file_soft(TEXT, BIGINT, BIGINT) IS 'Sometimes /proc files aren''t accessible due to race conditions. We turn it into a soft fail throug this wrapper';
-GRANT EXECUTE ON FUNCTION "instrumentation"."pg_read_file_soft"(TEXT, BIGINT, BIGINT) TO PUBLIC;
+REVOKE ALL PRIVILEGES ON FUNCTION instrumentation.read_binary_file_abs(TEXT, BIGINT, BIGINT) FROM PUBLIC; -- just for good measure
+COMMENT ON FUNCTION instrumentation.read_binary_file_abs(TEXT, BIGINT, BIGINT) IS 'Insecure version of pg_read_binary_file. This allows reading of any file the backend process has access to.
+Actually implemented as a single-file wrapper for read_binary_files_abs()';
+
+
+CREATE FUNCTION instrumentation.read_files_abs(
+	file_names TEXT[],
+	read_start BIGINT DEFAULT 0,
+	read_length BIGINT DEFAULT 536870912
+) RETURNS TABLE (
+	fn TEXT,
+	fd TEXT
+) LANGUAGE 'sql' SECURITY INVOKER STABLE RETURNS NULL ON NULL INPUT AS $CODE$
+	SELECT
+		fn,
+		convert_from(rbfa.fd, (SELECT s.setting FROM pg_settings AS s WHERE (s.name = 'client_encoding')))
+	FROM
+		instrumentation.read_binary_files_abs($1, $2, $3) AS rbfa
+	;
+$CODE$;
+REVOKE ALL PRIVILEGES ON FUNCTION instrumentation.read_files_abs(TEXT[], BIGINT, BIGINT) FROM PUBLIC; -- just for good measure
+COMMENT ON FUNCTION instrumentation.read_binary_files_abs(TEXT[], BIGINT, BIGINT) IS 'Multi-file version of read_file_abs (see below). Allows the passing of multiple file names as an array.
+Same result set as read_binary_files_abs, with the exception that fd is an encoding-safe text column (in fact, it is just a wrapper for it)';
+
+
+CREATE FUNCTION instrumentation.read_file_abs(
+	file_name TEXT,
+	read_start BIGINT DEFAULT 0,
+	read_length BIGINT DEFAULT 67108864
+) RETURNS TEXT LANGUAGE 'sql' SECURITY INVOKER STABLE RETURNS NULL ON NULL INPUT AS $CODE$
+	SELECT
+		rbfa.fd
+	FROM
+		instrumentation.read_files_abs(ARRAY[$1], $2, $3) AS rbfa
+	;
+$CODE$;
+REVOKE ALL PRIVILEGES ON FUNCTION instrumentation.read_file_abs(TEXT, BIGINT, BIGINT) FROM PUBLIC; -- just for good measure
+COMMENT ON FUNCTION instrumentation.read_file_abs(TEXT, BIGINT, BIGINT) IS 'Insecure version of pg_read_file. This allows reading of any file the backend process has access to.
+Actually implemented as a single-file wrapper for read_files_abs()';
+
+
+
+
+
 
 CREATE FUNCTION instrumentation.get_os_sys_cpus() RETURNS TABLE (
 	cpu_id SMALLINT,
@@ -76,15 +156,15 @@ CREATE FUNCTION instrumentation.get_os_sys_cpus() RETURNS TABLE (
 		advertised_cpu_dirs AS (
 			SELECT
 				CAST(REPLACE(scfs.scf_dir, 'cpu', '') AS SMALLINT) AS cpu_id,
-				CONCAT('./sys/devices/system/cpu/', scfs.scf_dir, '/topology') AS cpu_topo_dir
+				CONCAT('/sys/devices/system/cpu/', scfs.scf_dir, '/topology') AS cpu_topo_dir
 			FROM
-				pg_ls_dir('./sys/devices/system/cpu') AS scfs(scf_dir)
+				instrumentation.ls_dir_abs('/sys/devices/system/cpu') AS scfs(scf_dir)
 			WHERE
 				(UPPER(scfs.scf_dir) ~ '^CPU[0-9]{1,14}$')
 		)
 		SELECT
 			ad.cpu_id,
-			CAST(pg_read_file(CONCAT(ad.cpu_topo_dir, '/physical_package_id'), 0, 4096) AS SMALLINT) AS physical_package_id,
+			instrumentation.read_file_abs(CONCAT(ad.cpu_topo_dir, '/physical_package_id'), 0, 4096)::SMALLINT AS physical_package_id,
 			-- the following madness explodes lists of cpus specified as ranges and removes duplicates. unfortunately it has to be repeated twice (creating a function for this seems crazy)
 			-- we assume that comma-separated fields come in two forms: single cpu id or range (in the hyphen-separated form)
 			(
@@ -104,12 +184,12 @@ CREATE FUNCTION instrumentation.get_os_sys_cpus() RETURNS TABLE (
 									)
 							END) AS SMALLINT) AS "cpuid"
 						FROM
-							UNNEST(CAST(CONCAT('{', pg_read_file(CONCAT(ad.cpu_topo_dir, '/core_siblings_list'), 0, 16384), '}') AS TEXT[])) AS cfs(cfc)
+							UNNEST(CAST(CONCAT('{', instrumentation.read_file_abs(CONCAT(ad.cpu_topo_dir, '/core_siblings_list'), 0, 16384), '}') AS TEXT[])) AS cfs(cfc)
 						ORDER BY
 							cpuid ASC
 					) AS c
 			) AS core_siblings,
-			CAST(pg_read_file(CONCAT(ad.cpu_topo_dir, '/core_id'), 0, 4096) AS SMALLINT) AS core_id,
+			CAST(instrumentation.read_file_abs(CONCAT(ad.cpu_topo_dir, '/core_id'), 0, 4096) AS SMALLINT) AS core_id,
 			(
 				SELECT
 					array_agg(c.cpuid)
@@ -127,7 +207,7 @@ CREATE FUNCTION instrumentation.get_os_sys_cpus() RETURNS TABLE (
 									)
 							END) AS SMALLINT) AS "cpuid"
 						FROM
-							UNNEST(CAST(CONCAT('{', pg_read_file(CONCAT(ad.cpu_topo_dir, '/thread_siblings_list'), 0, 16384), '}') AS TEXT[])) AS cfs(cfc)
+							UNNEST(CAST(CONCAT('{', instrumentation.read_file_abs(CONCAT(ad.cpu_topo_dir, '/thread_siblings_list'), 0, 16384), '}') AS TEXT[])) AS cfs(cfc)
 						ORDER BY
 							cpuid ASC
 					) AS c
@@ -138,7 +218,9 @@ CREATE FUNCTION instrumentation.get_os_sys_cpus() RETURNS TABLE (
 $ctd$;
 COMMENT ON FUNCTION instrumentation.get_os_sys_cpus() IS '
 Implementation of os_sys_cpus. Written as a function to bypass security restrictions.
-List of CPUs, as presented in /sys/devices/system/cpu/cpu. The siblings lists are converted into to arrays of smallints. Some trickery (madness?) is used to ensure ordering and uniquess in the arrays
+List of CPUs, as presented in /sys/devices/system/cpu/cpu. The siblings lists are converted into to arrays of smallints. Some trickery (madness?) is used to ensure ordering and uniquess in the arrays.
+
+This function has not been optimized for the new multi-file access functionality yet
 ';
 GRANT EXECUTE ON FUNCTION instrumentation.get_os_sys_cpus() TO PUBLIC;
 
@@ -182,8 +264,6 @@ COMMENT ON VIEW instrumentation.os_sys_cpu_threads IS 'List of processor threads
 GRANT SELECT ON TABLE instrumentation.os_sys_cpus TO PUBLIC;
 
 
-
-
 CREATE FUNCTION instrumentation.get_os_proc_stat() RETURNS TABLE (
 	cpu_id SMALLINT,
 	jiffies_user BIGINT,
@@ -196,6 +276,16 @@ CREATE FUNCTION instrumentation.get_os_proc_stat() RETURNS TABLE (
 	jiffies_steal BIGINT,
 	jiffies_guest BIGINT
 ) LANGUAGE 'sql' STABLE SECURITY DEFINER RETURNS NULL ON NULL INPUT COST 1000000000 AS $ops$
+	-- it is very important that we use CTEs here as the perl functions need to be materialized
+	WITH
+		cpu_stat AS (
+				SELECT
+					regexp_split_to_array(regexp_replace(UPPER(st.row_text), '^CPU', ''), '\s+') AS cpu_fields
+				FROM
+					regexp_split_to_table(instrumentation.read_file_abs('/proc/stat', 0, 1048576), '\n', 'n') AS st(row_text)
+				WHERE
+					UPPER(st.row_text) ~ '^CPU[0-9]*\s'
+		)
 	SELECT
 		CAST((CASE WHEN (cpu_stat.cpu_fields[1] ~ '^[0-9]+$') THEN cpu_stat.cpu_fields[1] ELSE null END) AS SMALLINT) AS cpu_id,
 		CAST(cpu_stat.cpu_fields[2] AS BIGINT) AS jiffies_user,
@@ -208,18 +298,12 @@ CREATE FUNCTION instrumentation.get_os_proc_stat() RETURNS TABLE (
 		CAST(cpu_stat.cpu_fields[9] AS BIGINT) AS jiffies_steal,
 		CAST(cpu_stat.cpu_fields[10] AS BIGINT) AS jiffies_guest
 	FROM
-		(
-			SELECT
-				regexp_split_to_array(regexp_replace(UPPER(st.row_text), '^CPU', ''), '\s+') AS cpu_fields
-			FROM
-				regexp_split_to_table(pg_read_file('./proc/stat', 0, 16777216), '\n', 'n') AS st(row_text)
-			WHERE
-				UPPER(st.row_text) ~ '^CPU[0-9]*\s'
-		) AS cpu_stat
+		cpu_stat
 $ops$;
 COMMENT ON FUNCTION instrumentation.get_os_proc_stat() IS '
 Implementation of os_proc_stat. Written as a function to bypass security restrictions.
 A relalational friendly rendering of /proc/stat, FOR CPU ACTIVITY INFO ONLY!!!
+Note that an NULL cpu_id represents the grand total
 ';
 GRANT EXECUTE ON FUNCTION instrumentation.get_os_proc_stat() TO PUBLIC;
 
@@ -243,7 +327,7 @@ CREATE FUNCTION instrumentation.get_os_proc_loadavg() RETURNS TABLE (
 	WITH
 		loadavg AS (
 			SELECT
-				regexp_split_to_array(regexp_replace(pg_read_file('./proc/loadavg', 0, 65536), '\n|\r', ''), '\s+') AS f
+				regexp_split_to_array(regexp_replace(instrumentation.read_file_abs('/proc/loadavg', 0, 65536), '\n|\r', ''), '\s+') AS f
 		)
 	SELECT
 		CAST(l.f[1] AS DOUBLE PRECISION) AS loadavg_60s,
@@ -316,6 +400,34 @@ CREATE FUNCTION instrumentation.get_os_proc_processes() RETURNS TABLE (
 	guest_time NUMERIC(20, 0),
 	cguest_time NUMERIC(20, 0)
 ) LANGUAGE 'sql' STABLE SECURITY DEFINER RETURNS NULL ON NULL INPUT COST 1000000000 AS $opp$
+	-- it is very important that we use CTEs here as the perl functions need to be materialized
+	WITH
+		p AS (
+			SELECT
+				-- some retarded process injects white spaces into the process image name (I'm looking at you, EMC HBAs driver).
+				-- This makes separating /proc/<pid>/stat a fields a little tricky. We rely on brackets first
+				(
+					ARRAY[
+						stat_files.image_split[1], -- PID
+						stat_files.image_split[2]  -- argv0
+					]
+				||
+					STRING_TO_ARRAY(stat_files.image_split[3], ' ') -- everything else
+				) AS proc_stat_data
+				
+			FROM
+				-- we use our multi-file open function
+				(
+					SELECT
+						regexp_split_to_array(REPLACE(rf.fd, CHR(10), ''), '\s+\(|\)\s+') AS image_split
+					FROM
+						instrumentation.read_files_abs(
+							(SELECT array_agg(CONCAT('/proc/', pd.proc_dir, '/stat')) FROM instrumentation.ls_dir_abs('/proc') AS pd(proc_dir) WHERE (pd.proc_dir ~ '^[0-9]{1,14}$')),
+							0,
+							65536
+						) AS rf
+				) AS stat_files
+		)
 	SELECT
 		CAST(p.proc_stat_data[1] AS BIGINT) AS pid,
 		CAST(p.proc_stat_data[2] AS VARCHAR(256)) AS comm,
@@ -362,28 +474,9 @@ CREATE FUNCTION instrumentation.get_os_proc_processes() RETURNS TABLE (
 		CAST(p.proc_stat_data[43] AS NUMERIC(20, 0)) AS guest_time,
 		CAST(p.proc_stat_data[44] AS NUMERIC(20, 0)) AS cguest_time
 	FROM
-		(
-			SELECT
-				-- some retarded process injects white spaces into the process image name (I'm looking at you, EMC HBAs driver).
-				-- This makes separating /proc/<pid>/stat a fields a little tricky. We rely on brackets first
-				(
-					ARRAY[
-						stat_files.image_split[1], -- PID
-						stat_files.image_split[2] -- argv0
-					]
-				||
-					STRING_TO_ARRAY(stat_files.image_split[3], ' ') -- everything else
-				) AS proc_stat_data
-				
-			FROM
-				(
-					SELECT
-						regexp_split_to_array(REPLACE(instrumentation.pg_read_file_soft('./proc/' || dir_list.item_name || '/stat', 0, 65536), CHR(10), ''), '\s+\(|\)\s+') AS image_split
-					FROM
-						(SELECT pd.proc_dir FROM pg_ls_dir('./proc') AS pd(proc_dir) WHERE pd.proc_dir ~ '^[0-9]{1,14}$') AS dir_list(item_name)
-				) AS stat_files
-		) AS p
-;$opp$;
+		p
+	;
+$opp$;
 COMMENT ON FUNCTION instrumentation.get_os_proc_processes() IS '
 Implementation of os_proc_processes. Written as a function to bypass security restrictions.
 basically the contents of /proc/<pid>/stat, in a relational-friendly way.
@@ -393,14 +486,13 @@ which force us to use numeric (the alternative would be altering the actual valu
 GRANT EXECUTE ON FUNCTION instrumentation.get_os_proc_processes() TO PUBLIC;
 
 
+
+
 CREATE VIEW instrumentation.os_proc_processes AS
 	SELECT * FROM instrumentation.get_os_proc_processes()
 ;
 COMMENT ON VIEW instrumentation.os_proc_processes IS 'See invoked function';
 GRANT SELECT ON TABLE instrumentation.os_proc_processes TO PUBLIC;
-
-
-
 
 
 CREATE FUNCTION instrumentation.get_os_proc_processes_io() RETURNS TABLE (
@@ -413,6 +505,19 @@ CREATE FUNCTION instrumentation.get_os_proc_processes_io() RETURNS TABLE (
 	write_bytes NUMERIC(20, 0),
 	cancelled_write_bytes NUMERIC(20, 0)
 ) LANGUAGE 'sql' STABLE SECURITY DEFINER RETURNS NULL ON NULL INPUT COST 1000000000 AS $oppio$
+	-- it is very important that we use CTEs here as the perl functions need to be materialized
+	WITH
+		osp AS (
+			SELECT
+				split_part(rf.fn, '/', 3)::BIGINT AS proc_pid,
+				rf.fd AS proc_stat_data
+			FROM
+				instrumentation.read_files_abs(
+					(SELECT array_agg(CONCAT('/proc/', pd.item_name, '/io')) FROM instrumentation.ls_dir_abs('/proc') AS pd(item_name) WHERE (pd.item_name ~ '^[0-9]+$')),
+					0,
+					65536
+				) AS rf
+		)
 	SELECT
 		CAST(osp.proc_pid AS BIGINT) AS pid,
 		CAST(regexp_replace(regexp_replace(osp.proc_stat_data, '.*(\n|^)rchar: *', '', ''), '[^0-9].*', '') AS NUMERIC(20, 0)) AS rchar,
@@ -423,15 +528,7 @@ CREATE FUNCTION instrumentation.get_os_proc_processes_io() RETURNS TABLE (
 		CAST(regexp_replace(regexp_replace(osp.proc_stat_data, '.*(\n|^)write_bytes: *', '', ''), '[^0-9].*', '') AS NUMERIC(20, 0)) AS write_bytes,
 		CAST(regexp_replace(regexp_replace(osp.proc_stat_data, '.*(\n|^)cancelled_write_bytes: *', '', ''), '[^0-9].*', '') AS NUMERIC(20, 0)) AS cancelled_write_bytes
 	FROM
-		(
-			SELECT
-				CAST(d.item_name AS BIGINT) AS proc_pid,
-				instrumentation.pg_read_file_soft('./proc/' || d.item_name || '/io', 0, 65536) AS proc_stat_data
-			FROM
-				(SELECT pg_ls_dir('./proc')) AS d(item_name)
-			WHERE
-				(d.item_name ~ '^[0-9]+$')
-		) AS osp
+		osp
 $oppio$;
 COMMENT ON FUNCTION instrumentation.get_os_proc_processes_io() IS '
 Implementation of os_proc_processes_io. Written as a function to bypass security restrictions.
@@ -441,12 +538,13 @@ It uses numeric to prevent signed int overflow from unsigned long input :(
 GRANT EXECUTE ON FUNCTION instrumentation.get_os_proc_processes_io() TO PUBLIC;
 
 
+
+
 CREATE VIEW instrumentation.os_proc_processes_io AS
 	SELECT * FROM instrumentation.get_os_proc_processes_io()
 ;
 COMMENT ON VIEW instrumentation.os_proc_processes_io IS 'See invoked function';
 GRANT SELECT ON TABLE instrumentation.os_proc_processes_io TO PUBLIC;
-
 
 CREATE VIEW instrumentation.sessions_status AS
 	SELECT
@@ -502,5 +600,7 @@ CREATE VIEW instrumentation.sessions_status AS
 			gl.granted
 ;
 COMMENT ON VIEW instrumentation.sessions_status IS 'pg_stat_activity on steroids. It shows the locking process/relation and retrieves additional information from the OS (from /proc)';
+
+
 
 COMMIT TRANSACTION;
