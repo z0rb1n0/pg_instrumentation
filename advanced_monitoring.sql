@@ -28,6 +28,11 @@ DROP FUNCTION IF EXISTS instrumentation.get_os_proc_loadavg();
 DROP FUNCTION IF EXISTS instrumentation.get_os_proc_processes();
 DROP FUNCTION IF EXISTS instrumentation.get_os_proc_processes_io();
 
+DROP FUNCTION IF EXISTS instrumentation.read_file_abs(TEXT, BIGINT, BIGINT);
+DROP FUNCTION IF EXISTS instrumentation.read_binary_file_abs(TEXT, BIGINT, BIGINT);
+DROP FUNCTION IF EXISTS instrumentation.read_files_abs(TEXT[], BIGINT, BIGINT);
+DROP FUNCTION IF EXISTS instrumentation.read_binary_files_abs(TEXT[], BIGINT, BIGINT);
+DROP FUNCTION IF EXISTS instrumentation.ls_dir_abs(TEXT);
 
 
 GRANT USAGE ON SCHEMA "instrumentation" TO PUBLIC;
@@ -604,3 +609,4 @@ COMMENT ON VIEW instrumentation.sessions_status IS 'pg_stat_activity on steroids
 
 
 COMMIT TRANSACTION;
+
