@@ -20,13 +20,16 @@ define("TERM_MODE_UNDERLINE", pow(2, 5));
 define("TERM_MODE_REVERSE", pow(2, 6));
 define("TERM_MODE_STANDOUT", pow(2, 7));
 
-$input_param_map = build_param_map($argv);
 
-define("DB_HOST", $input_param_map["DB_HOST"] ?: "127.0.0.1");
-define("DB_PORT", $input_param_map["DB_PORT"] ?: 5432);
-define("DB_USER", $input_param_map["DB_USER"] ?: "postgres");
-define("DB_PASSWORD", $input_param_map["DB_PASSWORD"] ?: "postgres");
-define("DB_NAME", $input_param_map["DB_NAME"] ?: "postgres");
+define("DEFAULT_DB_HOST", "/tmp");
+define("DEFAULT_DB_PORT", 5432);
+define("DEFAULT_DB_USER", "postgres");
+define("DEFAULT_DB_PASSWORD", "postgres");
+define("DEFAULT_DB_NAME", "postgres");
+
+
+
+
 define("CONNECTION_RETRY_INTERVAL", 5000); // in milliseconds
 define("POLL_INTERVAL", 2000); // in milliseconds
 define("MAX_SQL_OUTPUT_LINES", 1);
@@ -34,7 +37,6 @@ define("PROCESS_LOG_MAX_CONNECTIONS_PERCENTAGE", 80.0);
 define("STATEMENT_AGE_ALERT_THRESHOLD", 1000);
 define("GET_SLAVE_PROCESSES", 1);
 
-print_connection_info($input_param_map);
 
 // this is a wild assumption...Can't remove it without more server-side code.
 // Unfortunately we're left with 2 options there: plperlu, or finding a /proc
@@ -60,13 +62,18 @@ function usage($error) {
     if($error)
         printf("Invalid parameters.\n");
     printf("Usage:\n");
-    printf("\t./pg_top.php [-U <username\>] [-h <hostname>] [-p <port>] [-W <password>] [<database_name>]\n");
+    printf("\t./pg_top.php [-U <username>] [-h <hostname>] [-p <port>] [-W <password>] [<database_name>]\n");
     die();
 }
 
 function print_connection_info($input_param_map) {
     printf("-------------------------------------------------------------------------------\n");
-    printf("Connecting %1\$s:%2\$d using user %3\$s and %4\$s password\n", DB_HOST, DB_PORT, DB_USER, $input_param_map["DB_PASSWORD"] ? "given" : "DEFAULT");
+    printf("Connecting %1\$s:%2\$d using user %3\$s and database %4\$s\n",
+		$input_param_map["DB_HOST"],
+		$input_param_map["DB_PORT"],
+		$input_param_map["DB_USER"],
+		$input_param_map["DB_NAME"]
+	);
     printf("-------------------------------------------------------------------------------\n");
 }
 
@@ -81,7 +88,7 @@ function build_param_map($args) {
                 $map["DB_USER"] = $args[++$i];
                 break;
             case "-h" :
-                $ip = gethostbyname($args[++$i]); // lets resolve FQDN first to avoid layout problems
+                $ip = $args[++$i];
                 $map["DB_HOST"] = $ip;
                 break;
             case "-p" :
@@ -91,7 +98,7 @@ function build_param_map($args) {
                 $map["DB_PASSWORD"] = $args[++$i];
                 break;
             default:
-                if($map["DB_NAME"])
+                if(array_key_exists("DB_NAME", $map))
                     usage(true);
                 else
                     $map["DB_NAME"] = $args[$i];
@@ -140,8 +147,26 @@ FROM
 
 
 	// enable for debugging
-	// enable for debugging
 	set_error_handler("just_croak");
+
+
+
+	$param_map = build_param_map($argv);
+
+	# we pick the values from whichever source they come first
+	$consts = get_defined_constants();
+
+	foreach (["DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME"] as $c_param) {
+		$param_map[$c_param] = array_key_exists($c_param, $param_map) ? $param_map[$c_param] : $consts["DEFAULT_" . $c_param];
+	}
+	unset($consts);
+	print_connection_info($param_map);
+
+	// If the host is not a local socket, lets resolve FQDN first to avoid layout problems
+	if (substr($param_map["DB_HOST"], 0, 1) != "/") {
+		$param_map["DB_HOST"] = gethostbyname($param_map["DB_HOST"]);
+	}
+
 
 	getenv("TERM") || trigger_error("Not running on a terminal. Goodbye", E_USER_ERROR);
 
@@ -177,23 +202,23 @@ FROM
 		// the list of hosts is built on every loop based on wheter or not slaves are used/desired
 
 		$db_cnn_string = sprintf("host='%1\$s' port=%2\$d user='%3\$s' password='%4\$s' dbname='%5\$s' application_name='%6\$s'",
-			DB_HOST,
-			DB_PORT,
-			DB_USER,
-			DB_PASSWORD,
-			DB_NAME,
+			$param_map["DB_HOST"],
+			$param_map["DB_PORT"],
+			$param_map["DB_USER"],
+			$param_map["DB_PASSWORD"],
+			$param_map["DB_NAME"],
 			((isset($_SERVER['REQUEST_URI']) && strlen($_SERVER['REQUEST_URI'])) ? $_SERVER['REQUEST_URI'] : $_SERVER["SCRIPT_FILENAME"])
 		);
-		
+
 
 		$db_cnn = pg_connect($db_cnn_string);
 
 
 		// we first add the main host to the list (we're already connected to it)
 		$hosts_list = [
-			("[" . DB_HOST . "]:" . DB_PORT) => [
-				"address" => DB_HOST,
-				"port" => DB_PORT,
+			("[" . $param_map["DB_HOST"] . "]:" . $param_map["DB_PORT"]) => [
+				"address" => $param_map["DB_HOST"],
+				"port" => $param_map["DB_PORT"],
 				"connection" => &$db_cnn, // this can be by reference as we never manipulate the main connection
 				"max_connections" => null
 			]
@@ -213,18 +238,18 @@ FROM
 
 				$slave_cnn_string = sprintf("host='%1\$s' port=%2\$d user='%3\$s' password='%4\$s' dbname='%5\$s' application_name='%6\$s'",
 					$slave_host,
-					DB_PORT,
-					DB_USER,
-					DB_PASSWORD,
-					DB_NAME,
+					$param_map["DB_PORT"],
+					$param_map["DB_USER"],
+					$param_map["DB_PASSWORD"],
+					$param_map["DB_NAME"],
 					((isset($_SERVER['REQUEST_URI']) && strlen($_SERVER['REQUEST_URI'])) ? $_SERVER['REQUEST_URI'] : $_SERVER["SCRIPT_FILENAME"])
 				);
 				($slave_cnn = pg_connect($slave_cnn_string)) || die("ouch");
+
 			
-			
-				$hosts_list[("[" . $slave_host . "]:" . DB_PORT)] = [
+				$hosts_list[("[" . $slave_host . "]:" . $param_map["DB_PORT"])] = [
 					"address" => $slave_host,
-					"port" => DB_PORT,
+					"port" => $param_map["DB_PORT"],
 					"connection" => $slave_cnn,
 					"max_connections" => null
 				];
