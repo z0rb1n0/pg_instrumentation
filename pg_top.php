@@ -1,4 +1,4 @@
-#!/usr/bin/php --file
+#! /usr/bin/php -qC
 <?php
 
 
@@ -20,13 +20,13 @@ define("TERM_MODE_UNDERLINE", pow(2, 5));
 define("TERM_MODE_REVERSE", pow(2, 6));
 define("TERM_MODE_STANDOUT", pow(2, 7));
 
+$input_param_map = build_param_map($argv);
 
-define("DB_HOST", "172.16.10.2");
-//define("DB_HOST", "10.208.7.32");
-define("DB_PORT", 5432);
-define("DB_USER", "any_superuser");
-define("DB_PASSWORD", "lol, you wish");
-define("DB_NAME", "meh");
+define("DB_HOST", $input_param_map["DB_HOST"] ?: "127.0.0.1");
+define("DB_PORT", $input_param_map["DB_PORT"] ?: 5432);
+define("DB_USER", $input_param_map["DB_USER"] ?: "postgres");
+define("DB_PASSWORD", $input_param_map["DB_PASSWORD"] ?: "postgres");
+define("DB_NAME", $input_param_map["DB_NAME"] ?: "postgres");
 define("CONNECTION_RETRY_INTERVAL", 5000); // in milliseconds
 define("POLL_INTERVAL", 2000); // in milliseconds
 define("MAX_SQL_OUTPUT_LINES", 1);
@@ -34,6 +34,7 @@ define("PROCESS_LOG_MAX_CONNECTIONS_PERCENTAGE", 80.0);
 define("STATEMENT_AGE_ALERT_THRESHOLD", 1000);
 define("GET_SLAVE_PROCESSES", 1);
 
+print_connection_info($input_param_map);
 
 // this is a wild assumption...Can't remove it without more server-side code.
 // Unfortunately we're left with 2 options there: plperlu, or finding a /proc
@@ -55,7 +56,50 @@ function just_croak($errno, $errstr, $errfile, $errline, $errcontext) {
 	
 }
 
+function usage($error) {
+    if($error)
+        printf("Invalid parameters.\n");
+    printf("Usage:\n");
+    printf("\t./pg_top.php [-U <username\>] [-h <hostname>] [-p <port>] [-W <password>] [<database_name>]\n");
+    die();
+}
 
+function print_connection_info($input_param_map) {
+    printf("-------------------------------------------------------------------------------\n");
+    printf("Connecting %1\$s:%2\$d using user %3\$s and %4\$s password\n", DB_HOST, DB_PORT, DB_USER, $input_param_map["DB_PASSWORD"] ? "given" : "DEFAULT");
+    printf("-------------------------------------------------------------------------------\n");
+}
+
+function build_param_map($args) {
+    $i = 1;
+    $map = [];
+    while($i < sizeof($args)) {
+        switch ($args[$i]) {
+            case "--help" :
+                usage(false);
+            case "-U" :
+                $map["DB_USER"] = $args[++$i];
+                break;
+            case "-h" :
+                $ip = gethostbyname($args[++$i]); // lets resolve FQDN first to avoid layout problems
+                $map["DB_HOST"] = $ip;
+                break;
+            case "-p" :
+                $map["DB_PORT"] = $args[++$i];
+                break;
+            case "-W" :
+                $map["DB_PASSWORD"] = $args[++$i];
+                break;
+            default:
+                if($map["DB_NAME"])
+                    usage(true);
+                else
+                    $map["DB_NAME"] = $args[$i];
+        }
+        $i++;
+    }
+    return $map;
+}
 
 function get_log_line_prefix() {
 	$current_microtime = microtime(true);
