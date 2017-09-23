@@ -551,62 +551,75 @@ CREATE VIEW instrumentation.os_proc_processes_io AS
 COMMENT ON VIEW instrumentation.os_proc_processes_io IS 'See invoked function';
 GRANT SELECT ON TABLE instrumentation.os_proc_processes_io TO PUBLIC;
 
-CREATE VIEW instrumentation.sessions_status AS
-	SELECT
-		p.pid AS session_pid,
-		ps."state" AS process_state,
-		ps.utime AS process_utime,
-		ps.stime AS process_stime,
-		pio.rchar AS process_rchar,
-		pio.wchar AS process_wchar,
-		usename AS user_name,
-		datname AS database_name,
-		application_name AS app_name,
-		CAST((EXTRACT('epoch' FROM (clock_timestamp() - p.backend_start)) * 1000.0) AS BIGINT) AS process_age,
-		CAST((CASE WHEN (UPPER(p.state) ~ '((ACTIVE)|(FASTPATH)|(IN TRANSACTION))') THEN (EXTRACT('epoch' FROM (clock_timestamp() - p.query_start)) * 1000.0) ELSE -1.0 END) AS INT) AS statement_age,
-		(CASE WHEN p.waiting THEN gl.pid ELSE null END) AS blocking_lock_pid,
-		(
+
+
+-- conditional field modification based on pg_stat_activity changes in postgres >= 9.6
+DO LANGUAGE 'plpgsql' $cvc$
+DECLARE ddl_text TEXT := '';
+BEGIN
+	ddl_text = CONCAT(ddl_text, '
+		CREATE VIEW instrumentation.sessions_status AS
 			SELECT
-				lr.relname
-			FROM
-				pg_locks AS lrl INNER JOIN pg_class AS lr
-				ON
-					(lr.oid = lrl.relation)
-			WHERE
-				(lrl.virtualtransaction = wl.virtualtransaction)
-			AND
-				(NOT (lrl.relation IS NULL))
-			ORDER BY
-				(UPPER(lrl.locktype) = 'TUPLE') DESC
-			LIMIT 1
-		) AS lock_relation,
-		p.query AS query_sql
-	FROM
-		(
-			(
+				p.pid AS session_pid,
+				ps."state" AS process_state,
+				ps.utime AS process_utime,
+				ps.stime AS process_stime,
+				pio.rchar AS process_rchar,
+				pio.wchar AS process_wchar,
+				usename AS user_name,
+				datname AS database_name,
+				application_name AS app_name,
+				CAST((EXTRACT(''epoch'' FROM (clock_timestamp() - p.backend_start)) * 1000.0) AS BIGINT) AS process_age,
+				CAST((CASE WHEN (UPPER(p.state) ~ ''((ACTIVE)|(FASTPATH)|(IN TRANSACTION))'') THEN (EXTRACT(''epoch'' FROM (clock_timestamp() - p.query_start)) * 1000.0) ELSE -1.0 END) AS INT) AS statement_age,
+				(CASE WHEN (p.',	(CASE
+					WHEN (current_setting('server_version_num')::INT < 90600) THEN 'waiting'
+					ELSE ('wait_event_type IS NOT NULL')
+				END), ') THEN gl.pid ELSE null END) AS blocking_lock_pid,
 				(
-					pg_stat_activity AS p INNER JOIN instrumentation.os_proc_processes AS ps
+					SELECT
+						lr.relname
+					FROM
+						pg_locks AS lrl INNER JOIN pg_class AS lr
+						ON
+							(lr.oid = lrl.relation)
+					WHERE
+						(lrl.virtualtransaction = wl.virtualtransaction)
+					AND
+						(NOT (lrl.relation IS NULL))
+					ORDER BY
+						(UPPER(lrl.locktype) = ''TUPLE'') DESC
+					LIMIT 1
+				) AS lock_relation,
+				p.query AS query_sql
+			FROM
+				(
+					(
+						(
+							pg_stat_activity AS p INNER JOIN instrumentation.os_proc_processes AS ps
+							ON
+								(ps.pid = p.pid)
+						) INNER JOIN instrumentation.os_proc_processes_io AS pio
+						ON
+							(pio.pid = p.pid)
+					) LEFT JOIN pg_locks AS wl
 					ON
-						(ps.pid = p.pid)
-				) INNER JOIN instrumentation.os_proc_processes_io AS pio
+						(p.datname = current_database())
+					AND
+						(wl.pid = p.pid)
+					AND
+						(NOT wl.granted)
+				) LEFT JOIN pg_locks AS gl
 				ON
-					(pio.pid = p.pid)
-			) LEFT JOIN pg_locks AS wl
-			ON
-				(p.datname = current_database())
-			AND
-				(wl.pid = p.pid)
-			AND
-				(NOT wl.granted)
-		) LEFT JOIN pg_locks AS gl
-		ON
-			(gl.transactionid = wl.transactionid)
-		AND
-			gl.granted
-;
+					(gl.transactionid = wl.transactionid)
+				AND
+					gl.granted
+		;
+	');
+
+	--RAISE INFO '%', ddl_text;
+	EXECUTE ddl_text;
+END;
+$cvc$;
 COMMENT ON VIEW instrumentation.sessions_status IS 'pg_stat_activity on steroids. It shows the locking process/relation and retrieves additional information from the OS (from /proc)';
 
-
-
 COMMIT TRANSACTION;
-
