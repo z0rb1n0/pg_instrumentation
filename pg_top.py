@@ -3,9 +3,16 @@
 import sys, os, curses, time, atexit, signal, re
 
 
-ALIGN_LEFT = 1
-ALIGN_CENTER = 2
-ALIGN_RIGHT = 3
+print({n: idx for (idx, n) in enumerate([
+	"NONE",
+	"ALIGN_LEFT", "ALIGN_CENTER", "ALIGN_RIGHT",
+	# the following are straight from curses
+	"BLINK", "BOLD", "DIM", "REVERSE", "STANDOUT", "UNDERLINE"
+])})
+
+print(1 << 19)
+print(curses.COLOR_BLUE)
+sys.exit(0)
 
 
 
@@ -134,34 +141,171 @@ def get_proc_info():
 
 
 
-def tabulize(column_defs, records):
+class ColumnDefinition():
+	"""
+		Definition of a table column. A RowDefinition is basically a tuple
+		of many of these
+	"""
+	def __init__(self, 
+		label,
+		width = 12,
+		decimal_places = 3,
+		header_format = FORMAT_ALIGN_CENTER,
+		default_data_format = 0,
+		
+	):
+		"""
+			Standard initializer, sets the properties of a given column.
+			
+			Args:
+				label:				(str)The column label
+				width:				(int)Formatting width of the column.
+				decimal_places:		(int)How many decimal digits to print for floats. Note that decimal
+									digits and the dot count toward the total width
+				header_format:		(int)Bitmask representing 
+		"""
+sys.exit(0)
+
+
+
+def tabulize(
+	column_defs,
+	records,
+	formatters = {},
+	col_separator = " | ",
+	row_separator = None,
+	header_separator = "-"
+):
 	"""
 		Accepts a table column definition and 2 dimensional array of values,
-		and returns a 2-dimensional array representing the output data grid.
+		and returns a data grid string that can be printed.
 		Each element is formatted according to its data type and the definition
 		specs (eg: text does line-wrap but numbers don't and throw an error instead)
 		
-		
 		Args:
 		
-			column_defs:	(list)	a list of 4-tuples defining each column and its property. Each member
-							is defined by:
-								0) Column header
-								1) Column width (separator not included). Strings
-								   in eccess of this length will be wrapped down, other types will throw ValueError.
-								   This value (minus one for the dot) is also used as precision for float representation
-								2) Alignment of the data within the column. The default is type dependent (left for strings,
-								   right for numbers)
-								3) Scale of float representation
+			column_defs:		(list)	a list of 4-tuples defining each column and its property. Each member
+										It is defined by:
+											0) Column header
+											1)	Column width (separator not included). Strings
+												in eccess of this length will be wrapped down, other types will throw ValueError.
+												This value (minus one for the dot) is also used as precision for float representation.
+												A negative value indicates that strings should be truncated and not wrapped to the next
+												line.
+												Column headers will always be centered
+											2)	Flags the data within the column. The default is type dependent (left for strings,
+												right for numbers)
+											3)	Scale of float representation
 
-			records:		(list)	A list of lists defining the input tabular data.
-									If the number of members in any of the records is
-									different than that of column definitions, a
-									ValueError is thrown
+
+			records:			(list)	A list of tuples defining the input tabular data.
+										If the number of members in any of the records is
+										different than that of column definitions, a
+										ValueError is thrown.
+			formatters:			(dict)	Map of format modifiers for the rows/data cells in the data.
+										Members are indexed by row index in "records", 
 									
-		
+			col_separator:		(str)	Charater string between columns. It is the caller's responsibility to add some spacing in there
+			row_separator:		(str)	Character string that is used to draw lines between rows of data. Passing None skips the inter-row separator altoghether
+			header_separator:
+			
+
+
+		Example of a simplified process table definition:
+
+		formatted_table = tabulize(
+			column_defs = [
+				("PID",                 8,          FORMAT_ALIGN_RIGHT,                None),
+				("Command line",        32,         FORMAT_ALIGN_LEFT,                 None),
+				("ENV",                 64,         FORMAT_ALIGN_LEFT,                 None)
+			],
+			records = [
+				(1,           "init",         ""),
+				(5121,        "bash",         "PATH=/usr/local/bin:/usr/bin:/bin")
+			]
+		)
+
+		Returns:
+			a formatted version of "records" (a list of strings
 
 	"""
+	
+	# some validation first
+	if (not isinstance(column_defs, list)):
+		raise TypeError("column_defs must be a list")
+
+	for (col_def_id, col_def_flds) in enumerate(column_defs):
+		if (not isinstance(col_def, tuple)):
+			raise TypeError("column defintion member %d is of type  %s (should be a tuple)" % (col_def_id, col_def_flds.__class__.__name__))
+	
+	sys.exit(0)
+
+
+	if (not isinstance(column_defs, list)):
+		raise TypeError("column_defs must be a list")
+	
+	# we're breaking into multi-lines. We can't output anything until we looped.
+	# This 2 dimensional array represents the lines
+	pool_row_grid = []
+
+	for (col_id, col_def) in enumerate(column_defs):
+
+		if (col_id >= len(datum_line)):
+			break
+
+		col_width = len(col_def[0])
+		col_datum = datum_line[col_id]
+
+
+		# we first sanitize the data and pre-format it
+		decimals = None
+		if (isinstance(col_datum, (int, float))):
+			if (isinstance(col_datum, float)):
+				decimals = col_def[2] or 6 # this is quite arbitrary
+			else:
+				decimals = 0
+			datum_out_buf = ("%%.%df" % decimals) % float(col_datum)
+		else:
+			datum_out_buf = str(col_datum.strip())
+
+		# overflowing numbers are invalidated
+		if ((len(datum_out_buf) > col_width) and (decimals is not None)):
+			datum_out_buf = "#" * col_width
+
+
+		# Now we determine how many lines we need and prepare an array which will
+		# be our pool entry status report row (which could me multi-line)
+		# we need to break lines that are too long into smaller chunks
+		actual_lines = []
+		for dl in map(str.strip, datum_out_buf.split("\n")):
+			actual_lines += filter(len, [ dl[offset:offset + col_width].strip() for offset in range(0, len(dl), col_width) ])
+
+		# This involves breaking down all cells into width-sized chunks
+		# break it into its length
+		for (datum_line_id, datum_line_str) in enumerate(actual_lines):
+			if (datum_line_id >= len(pool_row_grid)):
+				# we initialize all lines as empty padded if the sub-row does not exist
+				pool_row_grid.append([ " " * len(cd[0]) for cd in column_defs ])
+
+			# we coose an appropriate justification, defaulting to
+			# left only for strings
+			j_func = {
+				FORMAT_ALIGN_LEFT: str.ljust,
+				FORMAT_ALIGN_RIGHT: str.ljust,
+				FORMAT_ALIGN_CENTER: str.center
+			}.get(col_def[1])
+			if (j_func is None):
+				j_func = (str.ljust if isinstance(col_datum, str) else str.rjust)
+
+			pool_row_grid[datum_line_id][col_id] = j_func(datum_line_str, col_width)
+
+			#pool_row_grid.app
+			#tmp_dl.extend([ datum_line[co:co + col_width] for co in range(0, len(datum_line), col_width) ])
+			
+
+	if (len(pool_row_grid)):
+		rep_lines.append(pool_row_grid)
+
 
 
 
@@ -178,9 +322,9 @@ if (__name__ == "__main__"):
 
 
 	column_defs = [
-		("Pool PID",			8,			ALIGN_RIGHT,				None),
-		("Command line", 		32,			ALIGN_LEFT,					None),
-		("ENV",					64,			ALIGN_LEFT,					None)
+		("Pool PID",			8,			FORMAT_ALIGN_RIGHT,				None),
+		("Command line", 		32,			FORMAT_ALIGN_LEFT,					None),
+		("ENV",					64,			FORMAT_ALIGN_LEFT,					None)
 	]
 
 
@@ -219,7 +363,6 @@ if (__name__ == "__main__"):
 		pool_row_grid = []
 
 		for (col_id, col_def) in enumerate(column_defs):
-
 
 			if (col_id >= len(datum_line)):
 				break
@@ -261,9 +404,9 @@ if (__name__ == "__main__"):
 				# we coose an appropriate justification, defaulting to
 				# left only for strings
 				j_func = {
-					ALIGN_LEFT: str.ljust,
-					ALIGN_RIGHT: str.ljust,
-					ALIGN_CENTER: str.center
+					FORMAT_ALIGN_LEFT: str.ljust,
+					FORMAT_ALIGN_RIGHT: str.ljust,
+					FORMAT_ALIGN_CENTER: str.center
 				}.get(col_def[1])
 				if (j_func is None):
 					j_func = (str.ljust if isinstance(col_datum, str) else str.rjust)
